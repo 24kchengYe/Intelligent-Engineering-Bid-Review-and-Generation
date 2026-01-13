@@ -198,7 +198,7 @@ def analysis_tab(ai_service, db_manager, document_parser):
 
     # 检查是否有上传的文件
     if not st.session_state.get('uploaded_files_content'):
-        st.warning("⚠️ 请先在"文件上传"标签页上传标书文件")
+        st.warning("⚠️ 请先在'文件上传'标签页上传标书文件")
         return
 
     uploaded_files_content = st.session_state.uploaded_files_content
@@ -253,7 +253,7 @@ def generation_tab(ai_service, db_manager):
 
     # 检查是否有分析报告
     if not st.session_state.get('analysis_report'):
-        st.warning("⚠️ 请先在"标书分析"标签页完成分析")
+        st.warning("⚠️ 请先在'标书分析'标签页完成分析")
         return
 
     st.markdown("### 📋 基于分析报告生成投标文件")
