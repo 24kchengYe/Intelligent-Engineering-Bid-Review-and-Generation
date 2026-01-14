@@ -110,19 +110,35 @@ class DocumentParser:
             }
 
     def parse_excel(self, file_path: str) -> Dict[str, str]:
-        """解析 Excel 文件"""
+        """解析 Excel 文件（支持多sheet、中英文混合）"""
         try:
             # 使用 pandas 读取，支持多个工作表
-            excel_file = pd.ExcelFile(file_path)
+            # engine='openpyxl' 支持 .xlsx, engine='xlrd' 支持 .xls
+            file_ext = os.path.splitext(file_path)[1].lower()
+            engine = 'openpyxl' if file_ext == '.xlsx' else 'xlrd'
+
+            excel_file = pd.ExcelFile(file_path, engine=engine)
             content = []
+            total_rows = 0
 
             for sheet_name in excel_file.sheet_names:
-                df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                content.append(f"\n--- 工作表: {sheet_name} ---")
+                # 读取时保持字符串格式，避免数字转换问题
+                df = pd.read_excel(
+                    excel_file,
+                    sheet_name=sheet_name,
+                    dtype=str,  # 保持原始字符串格式
+                    na_filter=False  # 不将空值转为 NaN
+                )
+
+                content.append(f"\n{'='*50}")
+                content.append(f"工作表: {sheet_name}")
+                content.append(f"{'='*50}")
 
                 # 转换为文本格式
                 if not df.empty:
-                    content.append(df.to_string(index=False))
+                    # 使用 to_string 保持表格格式，支持中英文对齐
+                    content.append(df.to_string(index=False, max_colwidth=100))
+                    total_rows += len(df)
                 else:
                     content.append("(空表)")
 
@@ -132,6 +148,7 @@ class DocumentParser:
                     'type': 'Excel',
                     'sheets': len(excel_file.sheet_names),
                     'sheet_names': excel_file.sheet_names,
+                    'total_rows': total_rows,
                     'file_name': os.path.basename(file_path)
                 }
             }

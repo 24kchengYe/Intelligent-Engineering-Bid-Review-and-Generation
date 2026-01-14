@@ -42,7 +42,6 @@ ANTHROPIC_API_KEY=your_actual_api_key
 
 ```bash
 streamlit run app.py
-```
 
 系统将在浏览器中自动打开，默认地址：http://localhost:8501
 

@@ -5,8 +5,15 @@ AI 服务模块
 
 import anthropic
 import os
+import json
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
+from .prompts import (
+    BIDDING_DOCUMENT_ANALYSIS_PROMPT,
+    EVALUATION_CRITERIA_EXTRACTION_PROMPT,
+    TECHNICAL_PROPOSAL_OUTLINE_PROMPT,
+    TECHNICAL_PROPOSAL_SECTION_PROMPT
+)
 
 # 加载环境变量
 load_dotenv()
@@ -26,8 +33,20 @@ class ClaudeService:
         if not self.api_key:
             raise ValueError("未找到 ANTHROPIC_API_KEY，请在 .env 文件中配置")
 
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-sonnet-4-20250514"  # 使用最新的 Sonnet 模型
+        # 支持 OpenRouter 或其他代理服务
+        base_url = os.getenv('ANTHROPIC_BASE_URL')
+        if base_url:
+            # 使用自定义 base_url（如 OpenRouter）
+            self.client = anthropic.Anthropic(
+                api_key=self.api_key,
+                base_url=base_url
+            )
+            # OpenRouter 的模型名称格式
+            self.model = os.getenv('ANTHROPIC_MODEL', 'anthropic/claude-sonnet-4')
+        else:
+            # 使用官方 Anthropic API
+            self.client = anthropic.Anthropic(api_key=self.api_key)
+            self.model = "claude-sonnet-4-20250514"  # 使用最新的 Sonnet 模型
 
     def analyze_bidding_document(self, document_contents: Dict[str, str]) -> str:
         """
@@ -213,6 +232,161 @@ class ClaudeService:
 """)
 
         return "".join(prompt_parts)
+
+    def parse_bidding_document_structured(self, document_contents: Dict[str, str]) -> str:
+        """
+        结构化解析招标文件（新版本，7大类别）
+
+        Args:
+            document_contents: 文件内容字典
+
+        Returns:
+            结构化解析报告
+        """
+        # 合并所有文件内容
+        combined_content = []
+        for file_type, content in document_contents.items():
+            if content and content.strip():
+                combined_content.append(f"\n【{file_type}】\n{content}\n")
+
+        document_text = "\n".join(combined_content)
+
+        # 使用新的解析提示词
+        prompt = BIDDING_DOCUMENT_ANALYSIS_PROMPT.format(
+            document_content=document_text
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=16000,  # 增加token限制，因为输出内容较多
+            temperature=0.2,   # 降低温度确保准确性
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response.content[0].text
+
+    def extract_evaluation_criteria(self, analysis_report: str) -> str:
+        """
+        从解析报告中提取评审标准
+
+        Args:
+            analysis_report: 招标文件解析报告
+
+        Returns:
+            评审标准总结
+        """
+        prompt = EVALUATION_CRITERIA_EXTRACTION_PROMPT.format(
+            analysis_report=analysis_report
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response.content[0].text
+
+    def generate_technical_proposal_outline(
+        self,
+        project_requirements: str,
+        evaluation_criteria: str
+    ) -> Dict:
+        """
+        生成技术标目录结构
+
+        Args:
+            project_requirements: 项目需求
+            evaluation_criteria: 评审标准
+
+        Returns:
+            目录结构（JSON格式）
+        """
+        prompt = TECHNICAL_PROPOSAL_OUTLINE_PROMPT.format(
+            project_requirements=project_requirements,
+            evaluation_criteria=evaluation_criteria
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            temperature=0.4,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        # 尝试从响应中提取JSON
+        response_text = response.content[0].text
+        try:
+            # 尝试解析JSON
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                json_text = response_text[json_start:json_end].strip()
+                return json.loads(json_text)
+            else:
+                # 如果没有代码块，尝试直接解析
+                return {"outline": response_text, "raw": True}
+        except:
+            return {"outline": response_text, "raw": True}
+
+    def generate_technical_proposal_section(
+        self,
+        section_title: str,
+        word_count: int,
+        section_requirements: str,
+        project_info: str,
+        evaluation_criteria: str
+    ) -> str:
+        """
+        生成技术标的单个章节
+
+        Args:
+            section_title: 章节标题
+            word_count: 建议字数
+            section_requirements: 章节要求
+            project_info: 项目基本信息
+            evaluation_criteria: 评审标准
+
+        Returns:
+            章节内容
+        """
+        prompt = TECHNICAL_PROPOSAL_SECTION_PROMPT.format(
+            section_title=section_title,
+            word_count=word_count,
+            section_requirements=section_requirements,
+            project_info=project_info,
+            evaluation_criteria=evaluation_criteria
+        )
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=8000,
+            temperature=0.5,  # 适中的温度，保持专业性同时有一定创造性
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response.content[0].text
 
     def chat(self, message: str, conversation_history: Optional[List[Dict]] = None) -> str:
         """

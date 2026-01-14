@@ -43,10 +43,11 @@ The system implements a sequential workflow with strict dependencies:
 
 1. **File Upload Phase** (`file_upload_tab`)
    - User uploads bidding documents (PDF/Word/Excel)
-   - Files are saved to `uploads/` with timestamped names
-   - `DocumentParser` immediately extracts text content
+   - Files are saved to `database/` folder with timestamped names (changed from `uploads/`)
+   - `DocumentParser` immediately extracts text content with encoding support for Chinese/English/numbers
    - File metadata and content stored in `st.session_state`
    - Record saved to database with status='draft'
+   - UI displays two sections: "招标文件" (2 categories) and "招标文件附件" (4 categories)
 
 2. **Analysis Phase** (`analysis_tab`)
    - **Requires**: uploaded files in session state
@@ -69,7 +70,7 @@ Critical session state variables that maintain workflow continuity:
 - `bidding_response`: Text - Final output
 - `project_name`: String - User-defined project identifier
 
-When loading historical records (`load_record`), files must be re-parsed from `uploads/` directory since only filenames are stored in database.
+When loading historical records (`load_record`), files must be re-parsed from `database/` directory since only filenames are stored in database.
 
 ### Service Initialization Pattern
 Services are initialized using `@st.cache_resource` to persist across Streamlit reruns:
@@ -80,25 +81,39 @@ ai_service, db_manager, document_parser = init_services()
 This caching is critical - services should NOT be re-instantiated in individual functions.
 
 ### File Category Configuration
-File types are defined in `file_upload_tab` via `file_categories` list:
+File types are defined in `file_upload_tab` via `file_categories` list, following the "智标领航" system design:
 ```python
 file_categories = [
-    {"name": "PDF规范", "types": ["pdf"], "help": "..."},
-    {"name": "Word方案", "types": ["docx", "doc"], "help": "..."},
-    # ... extensible
+    # 招标文件 (2 categories)
+    {"name": "招标文件正文", "types": [...], "category": "招标文件"},
+    {"name": "技术要求附件", "types": [...], "category": "招标文件"},
+    # 招标文件附件 (4 categories)
+    {"name": "工程量清单", "types": [...], "category": "招标文件附件"},
+    {"name": "评审标准附件", "types": [...], "category": "招标文件附件"},
+    {"name": "施工设计说明", "types": [...], "category": "招标文件附件"},
+    {"name": "方案建议书附件", "types": [...], "category": "招标文件附件"}
 ]
 ```
 
-To add new file types, append to this list. All categories are optional by design.
+Key features:
+- All file categories support multiple formats (PDF, Word, Excel)
+- All categories are optional by design
+- Files are grouped into "招标文件" and "招标文件附件" sections in UI
+- To add new categories, append to this list with appropriate `category` field
 
 ## Module Details
 
 ### `modules/document_parser.py`
 - **DocumentParser**: Registry pattern with `supported_formats` dict mapping extensions to parser methods
 - Each parser returns `{'content': str, 'metadata': dict}`
-- PDF: Uses PyMuPDF (fitz), extracts text page-by-page
-- Word: Extracts paragraphs and tables separately
-- Excel: Processes all sheets, converts DataFrames to string format
+- PDF: Uses PyMuPDF (fitz), extracts text page-by-page with encoding support
+- Word: Extracts paragraphs and tables separately, handles mixed Chinese/English text
+- Excel:
+  - Processes all sheets with `pd.ExcelFile`
+  - Uses `dtype=str` to preserve original formatting (numbers, Chinese, English)
+  - Uses appropriate engine: openpyxl for .xlsx, xlrd for .xls
+  - Returns metadata including sheet count, names, and total rows
+  - Converts DataFrames to readable string format with column width limit (100 chars)
 
 ### `modules/ai_service.py`
 - **ClaudeService**: Wraps Anthropic API client
@@ -182,7 +197,7 @@ st.warning("⚠️ 请先在"文件上传"标签页上传标书文件")  # Synta
 
 - Python 3.9+ required
 - Streamlit reruns entire script on user interaction - use session state for persistence
-- Uploaded files persist in `uploads/` directory - implement cleanup if needed
+- Uploaded files persist in `database/` directory - implement cleanup if needed
 - Database session managed by `DatabaseManager` - no manual commit needed except in CRUD methods
 - All file categories are intentionally optional to accommodate varying bidding document structures
 
