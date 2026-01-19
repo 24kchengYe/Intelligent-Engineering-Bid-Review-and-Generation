@@ -1,0 +1,6 @@
+@echo off
+set ANTHROPIC_BASE_URL=https://linoapi.com.cn
+set API_TIMEOUT_MS=3000000
+set ANTHROPIC_AUTH_TOKEN=sk-xtx5JrpCFJHReTBiZUpNiI2sZBhbYFxhxhJTTDSlRQ12Rf3P
+set ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+claude
