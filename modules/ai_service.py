@@ -1,13 +1,14 @@
 """
 AI 服务模块
-封装 Claude API 调用
+支持多种AI模型：OpenAI GPT-4o、Claude等
 """
 
-import anthropic
 import os
 import json
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
+from .ai_provider import get_ai_provider, AIProvider
+from .text_processor import TextProcessor, ContentCompressor
 from .prompts import (
     BIDDING_DOCUMENT_ANALYSIS_PROMPT,
     EVALUATION_CRITERIA_EXTRACTION_PROMPT,
@@ -20,33 +21,25 @@ load_dotenv()
 
 
 class ClaudeService:
-    """Claude AI 服务封装"""
+    """
+    AI 服务封装（支持多种AI模型）
 
-    def __init__(self, api_key: Optional[str] = None):
+    注意：虽然叫ClaudeService，但实际支持OpenAI、Claude等多种模型
+    为了保持向后兼容，类名不变
+    """
+
+    def __init__(self, provider: Optional[AIProvider] = None):
         """
-        初始化 Claude 服务
+        初始化 AI 服务
 
         Args:
-            api_key: API密钥，如果不提供则从环境变量读取
+            provider: AI Provider实例，如果不提供则从环境变量自动选择
         """
-        self.api_key = api_key or os.getenv('ANTHROPIC_API_KEY')
-        if not self.api_key:
-            raise ValueError("未找到 ANTHROPIC_API_KEY，请在 .env 文件中配置")
-
-        # 支持 OpenRouter 或其他代理服务
-        base_url = os.getenv('ANTHROPIC_BASE_URL')
-        if base_url:
-            # 使用自定义 base_url（如 OpenRouter）
-            self.client = anthropic.Anthropic(
-                api_key=self.api_key,
-                base_url=base_url
-            )
-            # OpenRouter 的模型名称格式
-            self.model = os.getenv('ANTHROPIC_MODEL', 'anthropic/claude-sonnet-4')
+        if provider:
+            self.provider = provider
         else:
-            # 使用官方 Anthropic API
-            self.client = anthropic.Anthropic(api_key=self.api_key)
-            self.model = "claude-sonnet-4-20250514"  # 使用最新的 Sonnet 模型
+            # 从环境变量自动选择provider
+            self.provider = get_ai_provider()
 
     def analyze_bidding_document(self, document_contents: Dict[str, str]) -> str:
         """
@@ -61,20 +54,8 @@ class ClaudeService:
         # 构建提示词
         prompt = self._build_analysis_prompt(document_contents)
 
-        # 调用 Claude API
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0.3,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.content[0].text
+        # 调用 AI Provider
+        return self.provider.generate(prompt, max_tokens=8000, temperature=0.3)
 
     def generate_bidding_response(
         self,
@@ -99,19 +80,8 @@ class ClaudeService:
             requirements
         )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0.5,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.content[0].text
+        # 调用 AI Provider
+        return self.provider.generate(prompt, max_tokens=8000, temperature=0.5)
 
     def _build_analysis_prompt(self, document_contents: Dict[str, str]) -> str:
         """构建标书分析提示词"""
@@ -235,7 +205,7 @@ class ClaudeService:
 
     def parse_bidding_document_structured(self, document_contents: Dict[str, str]) -> str:
         """
-        结构化解析招标文件（新版本，7大类别）
+        结构化解析招标文件（7类分析）- 支持大文档自动压缩
 
         Args:
             document_contents: 文件内容字典
@@ -251,24 +221,42 @@ class ClaudeService:
 
         document_text = "\n".join(combined_content)
 
+        # 估算token数
+        total_tokens = TextProcessor.estimate_tokens(document_text)
+        print(f"[AI Service] 文档总token数: {total_tokens:,}")
+
+        # 从环境变量读取配置
+        compression_ratio = float(os.getenv('COMPRESSION_RATIO', '1.0'))
+
+        print(f"[AI Service] 压缩率设置: {compression_ratio}")
+
+        # 仅按照用户设置的压缩率处理，不自动判断
+        if compression_ratio < 1.0:
+            # 计算目标token数
+            target_tokens = int(total_tokens * compression_ratio)
+
+            print(f"[AI Service] 开始智能压缩 ({total_tokens:,} → {target_tokens:,} tokens)")
+
+            # 压缩策略：保留关键信息（标题、要求、数值等）
+            compressed_text = ContentCompressor.compress_for_analysis(
+                document_text,
+                target_ratio=compression_ratio
+            )
+
+            document_text = compressed_text
+            final_tokens = TextProcessor.estimate_tokens(document_text)
+            actual_ratio = final_tokens / total_tokens
+            print(f"[AI Service] 压缩完成: {final_tokens:,} tokens，实际压缩率: {actual_ratio*100:.1f}%")
+        else:
+            print(f"[AI Service] 不压缩（COMPRESSION_RATIO=1.0）")
+
         # 使用新的解析提示词
         prompt = BIDDING_DOCUMENT_ANALYSIS_PROMPT.format(
             document_content=document_text
         )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=16000,  # 增加token限制，因为输出内容较多
-            temperature=0.2,   # 降低温度确保准确性
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.content[0].text
+        # 调用 AI Provider
+        return self.provider.generate(prompt, max_tokens=16000, temperature=0.2)
 
     def extract_evaluation_criteria(self, analysis_report: str) -> str:
         """
@@ -284,19 +272,8 @@ class ClaudeService:
             analysis_report=analysis_report
         )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0.3,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.content[0].text
+        # 调用 AI Provider
+        return self.provider.generate(prompt, max_tokens=8000, temperature=0.3)
 
     def generate_technical_proposal_outline(
         self,
@@ -318,20 +295,10 @@ class ClaudeService:
             evaluation_criteria=evaluation_criteria
         )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0.4,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
+        # 调用 AI Provider
+        response_text = self.provider.generate(prompt, max_tokens=8000, temperature=0.4)
 
         # 尝试从响应中提取JSON
-        response_text = response.content[0].text
         try:
             # 尝试解析JSON
             if "```json" in response_text:
@@ -374,19 +341,8 @@ class ClaudeService:
             evaluation_criteria=evaluation_criteria
         )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=8000,
-            temperature=0.5,  # 适中的温度，保持专业性同时有一定创造性
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        return response.content[0].text
+        # 调用 AI Provider
+        return self.provider.generate(prompt, max_tokens=8000, temperature=0.5)
 
     def chat(self, message: str, conversation_history: Optional[List[Dict]] = None) -> str:
         """
@@ -399,13 +355,6 @@ class ClaudeService:
         Returns:
             AI 回复
         """
-        messages = conversation_history or []
-        messages.append({"role": "user", "content": message})
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4000,
-            messages=messages
-        )
-
-        return response.content[0].text
+        # chat方法暂不支持provider（需要conversation_history）
+        # 如果需要使用，请直接调用Claude或OpenAI的原生接口
+        raise NotImplementedError("chat方法暂不支持多provider，请使用parse或generate方法")

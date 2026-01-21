@@ -8,6 +8,8 @@ from datetime import datetime
 from modules.document_parser import DocumentParser
 from modules.ai_service import ClaudeService
 from modules.database import DatabaseManager
+from modules.standards_manager import StandardsManager
+from modules.document_exporter import DocumentExporter
 
 # 页面配置
 st.set_page_config(
@@ -23,8 +25,11 @@ def init_services():
     try:
         ai_service = ClaudeService()
         db_manager = DatabaseManager()
-        document_parser = DocumentParser()
-        return ai_service, db_manager, document_parser
+        # enable_ocr=True: 扫描版PDF使用OCR（兜底）
+        # extract_tables=False: 关闭表格提取（提升速度，表格信息已在文本中）
+        document_parser = DocumentParser(enable_ocr=True, extract_tables=False)
+        standards_manager = StandardsManager()  # 国标管理器
+        return ai_service, db_manager, document_parser, standards_manager
     except Exception as e:
         st.error(f"初始化失败: {str(e)}")
         st.info("请检查 .env 文件中的 ANTHROPIC_API_KEY 是否配置正确")
@@ -50,7 +55,7 @@ if 'files_processed' not in st.session_state:
 
 def main():
     """主函数"""
-    ai_service, db_manager, document_parser = init_services()
+    ai_service, db_manager, document_parser, standards_manager = init_services()
 
     # 标题
     st.title("📋 智能标书审查系统")
@@ -120,7 +125,7 @@ def main():
             st.rerun()
 
     # 主界面 - 使用 tabs
-    tab1, tab2, tab3 = st.tabs(["📄 文件上传", "📊 标书分析", "📝 投标文件生成"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📄 文件上传", "📊 标书分析", "📝 投标文件生成", "📚 国标管理"])
 
     # Tab 1: 文件上传
     with tab1:
@@ -133,6 +138,10 @@ def main():
     # Tab 3: 投标文件生成
     with tab3:
         generation_tab(ai_service, db_manager)
+
+    # Tab 4: 国标管理
+    with tab4:
+        standards_management_tab(standards_manager)
 
 
 def file_upload_tab(db_manager, document_parser):
@@ -190,10 +199,6 @@ def file_upload_tab(db_manager, document_parser):
         }
     ]
 
-    # 从 session_state 恢复已有的文件信息（如果存在）
-    uploaded_files_info = st.session_state.get('uploaded_files_info', {}).copy()
-    uploaded_files_content = st.session_state.get('uploaded_files_content', {}).copy()
-
     # 分组显示：招标文件 和 招标文件附件
     st.markdown("#### 📋 招标文件")
     bidding_docs = [cat for cat in file_categories if cat['category'] == '招标文件']
@@ -211,47 +216,75 @@ def file_upload_tab(db_manager, document_parser):
             )
 
             if uploaded_file:
-                # 生成文件唯一标识
-                file_id = f"{category['name']}_{uploaded_file.name}_{uploaded_file.size}"
+                # 【优化】检查此类别是否已经上传过文件
+                if category['name'] in st.session_state.uploaded_files_info:
+                    # 已经上传过，显示已加载
+                    st.info(f"📌 已加载: {st.session_state.uploaded_files_info[category['name']]}")
+                else:
+                    # 首次上传，进行处理
+                    file_size_mb = uploaded_file.size / 1024 / 1024
 
-                # 检查是否已经处理过
-                if file_id not in st.session_state.files_processed:
+                    # 大文件警告
+                    if file_size_mb > 10:
+                        st.warning(f"⚠️ 文件较大({file_size_mb:.1f}MB)，解析可能需要1-3分钟，请耐心等待...")
+
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     file_ext = uploaded_file.name.split('.')[-1]
                     safe_filename = f"{category['name']}_{timestamp}.{file_ext}"
                     file_path = os.path.join("database", safe_filename)
 
+                    # 保存文件
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
 
-                    uploaded_files_info[category['name']] = safe_filename
-                    st.session_state.files_processed.add(file_id)
+                    # 显示处理进度
+                    progress_bar = st.empty()
+                    status_text = st.empty()
+
+                    def update_progress(page_num, total_pages, message):
+                        """进度回调"""
+                        progress = int((page_num / total_pages) * 100)
+                        progress_bar.progress(progress)
+                        status_text.text(message)
 
                     # 解析文件
                     try:
-                        parsed_result = document_parser.parse(file_path)
-                        uploaded_files_content[category['name']] = parsed_result['content']
+                        parsed_result = document_parser.parse(file_path, progress_callback=update_progress)
 
-                        # 立即更新 session_state
+                        # 清除进度显示
+                        progress_bar.empty()
+                        status_text.empty()
+
+                        # 【关键】立即更新 session_state（唯一数据源）
                         st.session_state.uploaded_files_info[category['name']] = safe_filename
                         st.session_state.uploaded_files_content[category['name']] = parsed_result['content']
 
-                        st.success(f"✅ 已上传并解析: {uploaded_file.name}")
+                        st.success(f"✅ 已上传并解析: {uploaded_file.name} ({file_size_mb:.1f}MB)")
                         if 'metadata' in parsed_result:
                             meta = parsed_result['metadata']
                             if 'sheets' in meta:
                                 st.caption(f"📊 包含 {meta['sheets']} 个工作表")
                             elif 'pages' in meta:
                                 st.caption(f"📄 共 {meta['pages']} 页")
+                                # 显示OCR信息
+                                if meta.get('ocr_pages', 0) > 0:
+                                    st.info(f"🔍 检测到扫描版PDF，已使用OCR识别 {meta['ocr_pages']}/{meta['pages']} 页")
+                                    # 显示失败页面
+                                    if meta.get('ocr_failed_count', 0) > 0:
+                                        failed_pages = meta.get('ocr_failed_pages', [])
+                                        st.warning(f"⚠️ {meta['ocr_failed_count']} 页OCR识别失败或超时（第{','.join(map(str, failed_pages))}页），内容可能不完整")
+                                # 显示表格信息
+                                if meta.get('tables_count', 0) > 0:
+                                    st.caption(f"📋 提取到 {meta['tables_count']} 个表格")
                     except Exception as e:
+                        progress_bar.empty()
+                        status_text.empty()
                         st.error(f"❌ 解析失败: {str(e)}")
-                else:
-                    # 已处理，从session获取
-                    if category['name'] in st.session_state.uploaded_files_info:
-                        uploaded_files_info[category['name']] = st.session_state.uploaded_files_info[category['name']]
-                    if category['name'] in st.session_state.uploaded_files_content:
-                        uploaded_files_content[category['name']] = st.session_state.uploaded_files_content[category['name']]
-                    st.info(f"📌 已加载: {uploaded_file.name}")
+                        import traceback
+                        st.error(traceback.format_exc())
+                        # 解析失败时删除文件
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
 
     st.markdown("#### 📎 招标文件附件")
     attachments = [cat for cat in file_categories if cat['category'] == '招标文件附件']
@@ -269,47 +302,75 @@ def file_upload_tab(db_manager, document_parser):
             )
 
             if uploaded_file:
-                # 生成文件唯一标识
-                file_id = f"{category['name']}_{uploaded_file.name}_{uploaded_file.size}"
+                # 【优化】检查此类别是否已经上传过文件
+                if category['name'] in st.session_state.uploaded_files_info:
+                    # 已经上传过，显示已加载
+                    st.info(f"📌 已加载: {st.session_state.uploaded_files_info[category['name']]}")
+                else:
+                    # 首次上传，进行处理
+                    file_size_mb = uploaded_file.size / 1024 / 1024
 
-                # 检查是否已经处理过
-                if file_id not in st.session_state.files_processed:
+                    # 大文件警告
+                    if file_size_mb > 10:
+                        st.warning(f"⚠️ 文件较大({file_size_mb:.1f}MB)，解析可能需要1-3分钟，请耐心等待...")
+
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     file_ext = uploaded_file.name.split('.')[-1]
                     safe_filename = f"{category['name']}_{timestamp}.{file_ext}"
                     file_path = os.path.join("database", safe_filename)
 
+                    # 保存文件
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
 
-                    uploaded_files_info[category['name']] = safe_filename
-                    st.session_state.files_processed.add(file_id)
+                    # 显示处理进度
+                    progress_bar = st.empty()
+                    status_text = st.empty()
+
+                    def update_progress(page_num, total_pages, message):
+                        """进度回调"""
+                        progress = int((page_num / total_pages) * 100)
+                        progress_bar.progress(progress)
+                        status_text.text(message)
 
                     # 解析文件
                     try:
-                        parsed_result = document_parser.parse(file_path)
-                        uploaded_files_content[category['name']] = parsed_result['content']
+                        parsed_result = document_parser.parse(file_path, progress_callback=update_progress)
 
-                        # 立即更新 session_state
+                        # 清除进度显示
+                        progress_bar.empty()
+                        status_text.empty()
+
+                        # 【关键】立即更新 session_state（唯一数据源）
                         st.session_state.uploaded_files_info[category['name']] = safe_filename
                         st.session_state.uploaded_files_content[category['name']] = parsed_result['content']
 
-                        st.success(f"✅ 已上传并解析: {uploaded_file.name}")
+                        st.success(f"✅ 已上传并解析: {uploaded_file.name} ({file_size_mb:.1f}MB)")
                         if 'metadata' in parsed_result:
                             meta = parsed_result['metadata']
                             if 'sheets' in meta:
                                 st.caption(f"📊 包含 {meta['sheets']} 个工作表")
                             elif 'pages' in meta:
                                 st.caption(f"📄 共 {meta['pages']} 页")
+                                # 显示OCR信息
+                                if meta.get('ocr_pages', 0) > 0:
+                                    st.info(f"🔍 检测到扫描版PDF，已使用OCR识别 {meta['ocr_pages']}/{meta['pages']} 页")
+                                    # 显示失败页面
+                                    if meta.get('ocr_failed_count', 0) > 0:
+                                        failed_pages = meta.get('ocr_failed_pages', [])
+                                        st.warning(f"⚠️ {meta['ocr_failed_count']} 页OCR识别失败或超时（第{','.join(map(str, failed_pages))}页），内容可能不完整")
+                                # 显示表格信息
+                                if meta.get('tables_count', 0) > 0:
+                                    st.caption(f"📋 提取到 {meta['tables_count']} 个表格")
                     except Exception as e:
+                        progress_bar.empty()
+                        status_text.empty()
                         st.error(f"❌ 解析失败: {str(e)}")
-                else:
-                    # 已处理，从session获取
-                    if category['name'] in st.session_state.uploaded_files_info:
-                        uploaded_files_info[category['name']] = st.session_state.uploaded_files_info[category['name']]
-                    if category['name'] in st.session_state.uploaded_files_content:
-                        uploaded_files_content[category['name']] = st.session_state.uploaded_files_content[category['name']]
-                    st.info(f"📌 已加载: {uploaded_file.name}")
+                        import traceback
+                        st.error(traceback.format_exc())
+                        # 解析失败时删除文件
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
 
     st.markdown("---")
 
@@ -320,35 +381,62 @@ def file_upload_tab(db_manager, document_parser):
             if not project_name:
                 st.error("请输入项目名称")
             else:
+                # 【BUG修复】使用session_state中的数据，而非局部变量
+                # 因为局部变量在Streamlit重运行时可能不包含所有已上传的文件
+                files_to_save = st.session_state.uploaded_files_info
+
+                # 调试信息
+                if len(files_to_save) == 0:
+                    st.warning("⚠️ 没有检测到已上传的文件，请先上传文件")
+                    st.stop()
+
                 # 保存到数据库
                 if st.session_state.current_record_id:
                     # 更新现有记录
                     record = db_manager.update_record(
                         st.session_state.current_record_id,
                         project_name=project_name,
-                        uploaded_files=uploaded_files_info
+                        uploaded_files=files_to_save
                     )
-                    st.success(f"✅ 项目已更新: {project_name}")
+                    st.success(f"✅ 项目已更新: {project_name} (包含 {len(files_to_save)} 个文件)")
                 else:
                     # 创建新记录
                     record = db_manager.create_record(
                         project_name=project_name,
-                        uploaded_files=uploaded_files_info
+                        uploaded_files=files_to_save
                     )
                     st.session_state.current_record_id = record.id
-                    st.success(f"✅ 项目已保存: {project_name}")
+                    st.success(f"✅ 项目已保存: {project_name} (包含 {len(files_to_save)} 个文件)")
 
-                # 保存到 session
+                # 更新 session（确保同步）
                 st.session_state.project_name = project_name
-                st.session_state.uploaded_files_content = uploaded_files_content
-                st.session_state.uploaded_files_info = uploaded_files_info
 
     # 显示已上传文件（从session_state读取，确保显示所有文件）
     display_files = st.session_state.get('uploaded_files_info', {})
     if display_files:
         st.markdown("### 已上传文件")
         for category, filename in display_files.items():
-            st.text(f"• {category}: {filename}")
+            col_file, col_delete = st.columns([4, 1])
+            with col_file:
+                st.text(f"• {category}: {filename}")
+            with col_delete:
+                if st.button("🗑️", key=f"delete_{category}", help="删除此文件"):
+                    # 删除物理文件
+                    file_path = os.path.join("database", filename)
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except Exception as e:
+                            st.error(f"删除文件失败: {e}")
+
+                    # 从session_state移除
+                    if category in st.session_state.uploaded_files_info:
+                        del st.session_state.uploaded_files_info[category]
+                    if category in st.session_state.uploaded_files_content:
+                        del st.session_state.uploaded_files_content[category]
+
+                    st.success(f"已删除: {category}")
+                    st.rerun()
 
 
 def analysis_tab(ai_service, db_manager, document_parser):
@@ -364,18 +452,56 @@ def analysis_tab(ai_service, db_manager, document_parser):
 
     # 显示文件概览
     st.markdown("### 📑 已加载文件")
-    for category in uploaded_files_content.keys():
-        st.text(f"• {category}")
+
+    col_list, col_export = st.columns([3, 1])
+
+    with col_list:
+        for category in uploaded_files_content.keys():
+            st.text(f"• {category}")
+
+    with col_export:
+        # 导出原始数据按钮
+        if st.button("📥 导出原始数据", help="导出所有文件解析后的原始文本（送入AI前的数据）"):
+            # 合并所有文件内容
+            all_content = []
+            for category, content in uploaded_files_content.items():
+                all_content.append(f"{'='*60}")
+                all_content.append(f"文件类别: {category}")
+                all_content.append(f"字符数: {len(content):,}")
+                all_content.append(f"{'='*60}")
+                all_content.append(content)
+                all_content.append("\n\n")
+
+            merged_data = "\n".join(all_content)
+
+            st.download_button(
+                label="💾 下载原始数据(TXT)",
+                data=merged_data,
+                file_name=f"原始解析数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
 
     st.markdown("---")
 
     # 分析按钮
     if st.button("🚀 开始结构化解析", type="primary", use_container_width=True):
-        # 计算输入token数（粗略估算：中文字符数/2）
+        # 精确计算token数
+        from modules.text_processor import TextProcessor
         total_chars = sum(len(content) for content in uploaded_files_content.values())
-        estimated_tokens = total_chars // 2
+        estimated_tokens = sum(TextProcessor.estimate_tokens(content) for content in uploaded_files_content.values())
 
-        st.info(f"📊 预估输入: {total_chars:,} 字符 ≈ {estimated_tokens:,} tokens")
+        # 读取压缩率配置
+        compression_ratio = float(os.getenv('COMPRESSION_RATIO', '1.0'))
+
+        st.info(f"📊 文档规模: {total_chars:,} 字符 ≈ {estimated_tokens:,} tokens")
+
+        # 显示压缩设置
+        if compression_ratio < 1.0:
+            target_tokens = int(estimated_tokens * compression_ratio)
+            st.info(f"🔧 压缩设置: {compression_ratio*100:.0f}%（将压缩至约 {target_tokens:,} tokens）")
+        else:
+            st.info(f"🔧 压缩设置: 不压缩（COMPRESSION_RATIO=1.0）")
 
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -438,10 +564,10 @@ def analysis_tab(ai_service, db_manager, document_parser):
         st.markdown("---")
 
         # 导出和提取按钮
-        col_export1, col_export2, col_extract = st.columns([1, 1, 2])
+        col_export1, col_export2, col_export3, col_extract = st.columns([1, 1, 1, 2])
         with col_export1:
             st.download_button(
-                label="📥 导出解析报告(MD)",
+                label="📥 导出(MD)",
                 data=st.session_state.analysis_report,
                 file_name=f"招标文件解析报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
                 mime="text/markdown",
@@ -449,12 +575,31 @@ def analysis_tab(ai_service, db_manager, document_parser):
             )
         with col_export2:
             st.download_button(
-                label="📥 导出解析报告(TXT)",
+                label="📥 导出(TXT)",
                 data=st.session_state.analysis_report,
                 file_name=f"招标文件解析报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                 mime="text/plain",
                 use_container_width=True
             )
+        with col_export3:
+            # Word导出
+            if st.button("📥 导出(Word)", use_container_width=True):
+                import tempfile
+                temp_path = tempfile.mktemp(suffix='.docx')
+                DocumentExporter.export_to_word(
+                    st.session_state.analysis_report,
+                    temp_path,
+                    title="招标文件解析报告"
+                )
+                with open(temp_path, 'rb') as f:
+                    st.download_button(
+                        label="💾 下载Word文档",
+                        data=f.read(),
+                        file_name=f"招标文件解析报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                os.remove(temp_path)
         with col_extract:
             # 显示评审标准提取状态
             if st.session_state.get('evaluation_criteria'):
@@ -689,17 +834,17 @@ def generation_tab(ai_service, db_manager):
 
             # 合并导出按钮
             st.markdown("---")
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
+
+            # 合并所有章节
+            merged_content = merge_all_sections(
+                st.session_state.technical_outline,
+                st.session_state.generated_sections
+            )
 
             with col1:
-                # 合并所有章节
-                merged_content = merge_all_sections(
-                    st.session_state.technical_outline,
-                    st.session_state.generated_sections
-                )
-
                 st.download_button(
-                    label="📥 导出完整技术标(MD)",
+                    label="📥 导出(MD)",
                     data=merged_content,
                     file_name=f"技术标_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
                     mime="text/markdown",
@@ -708,12 +853,38 @@ def generation_tab(ai_service, db_manager):
 
             with col2:
                 st.download_button(
-                    label="📥 导出完整技术标(TXT)",
+                    label="📥 导出(TXT)",
                     data=merged_content,
                     file_name=f"技术标_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                     mime="text/plain",
                     use_container_width=True
                 )
+
+            with col3:
+                # Word导出
+                if st.button("📥 导出(Word)", use_container_width=True, key="export_tech_word"):
+                    with st.spinner("正在生成Word文档..."):
+                        try:
+                            import tempfile
+                            temp_path = DocumentExporter.create_technical_proposal_word(
+                                st.session_state.technical_outline,
+                                st.session_state.generated_sections,
+                                project_name=st.session_state.get('project_name', '技术标文档')
+                            )
+                            with open(temp_path, 'rb') as f:
+                                word_data = f.read()
+                            os.remove(temp_path)
+
+                            st.download_button(
+                                label="💾 下载Word文档",
+                                data=word_data,
+                                file_name=f"技术标_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                use_container_width=True,
+                                key="download_tech_word"
+                            )
+                        except Exception as e:
+                            st.error(f"Word导出失败: {str(e)}")
 
 
 def display_outline_tree(outline_data):
@@ -869,6 +1040,172 @@ def delete_record_with_files(db_manager, record):
         db_manager.delete_record(record.id)
     except Exception as e:
         st.error(f"删除数据库记录失败: {str(e)}")
+
+
+def standards_management_tab(standards_manager):
+    """国标管理标签页"""
+    st.header("📚 国家/地方标准文件管理")
+    st.markdown("上传和管理国家标准、行业标准、地方标准文件，供标书分析时参考对比。")
+
+    # 获取统计信息
+    stats = standards_manager.get_statistics()
+
+    # 顶部统计卡片
+    st.markdown("### 📊 标准库统计")
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("总计", f"{stats['total']} 份")
+    with col2:
+        st.metric("国家标准", f"{stats['by_category'].get('国家标准', 0)} 份")
+    with col3:
+        st.metric("行业标准", f"{stats['by_category'].get('行业标准', 0)} 份")
+    with col4:
+        st.metric("地方标准", f"{stats['by_category'].get('地方标准', 0)} 份")
+    with col5:
+        st.metric("其他", f"{stats['by_category'].get('其他', 0)} 份")
+
+    st.markdown("---")
+
+    # 上传区域
+    st.markdown("### 📤 上传新标准")
+
+    col_upload, col_name = st.columns([2, 1])
+
+    with col_upload:
+        uploaded_standard = st.file_uploader(
+            "选择标准文件",
+            type=['pdf', 'docx', 'doc'],
+            help="支持PDF、Word格式的国家标准、行业标准、地方标准文件",
+            key="standard_uploader"
+        )
+
+    with col_name:
+        standard_name = st.text_input(
+            "标准名称（可选）",
+            placeholder="如：建设工程工程量清单计价规范",
+            help="留空则自动从文件名提取"
+        )
+
+    if uploaded_standard:
+        if st.button("✅ 确认上传", type="primary", use_container_width=True):
+            with st.spinner("正在处理文件..."):
+                result = standards_manager.add_standard(uploaded_standard, standard_name)
+
+                if result['success']:
+                    st.success(result['message'])
+                    st.markdown("**文件信息：**")
+                    data = result['data']
+                    st.write(f"- 标准编号: {data['standard_code']}")
+                    st.write(f"- 标准名称: {data['standard_name']}")
+                    st.write(f"- 分类: {data['category']}")
+                    st.write(f"- 文件大小: {data['file_size'] / 1024:.1f} KB")
+                    st.rerun()
+                else:
+                    st.error(result['message'])
+
+    st.markdown("---")
+
+    # 搜索和筛选
+    st.markdown("### 🔍 标准库浏览")
+
+    col_search, col_filter = st.columns([3, 1])
+
+    with col_search:
+        search_keyword = st.text_input(
+            "搜索标准",
+            placeholder="输入标准编号或名称关键词",
+            key="standards_search"
+        )
+
+    with col_filter:
+        category_filter = st.selectbox(
+            "分类筛选",
+            ["全部", "国家标准", "行业标准", "地方标准", "其他"],
+            key="category_filter"
+        )
+
+    # 获取标准列表
+    if search_keyword:
+        standards = standards_manager.search_standards(search_keyword)
+    else:
+        standards = standards_manager.get_all_standards(category_filter)
+
+    # 显示标准列表
+    if standards:
+        st.markdown(f"**找到 {len(standards)} 份标准文件**")
+
+        for standard in standards:
+            with st.expander(f"📄 {standard['standard_code']} - {standard['standard_name']}", expanded=False):
+                col_info, col_actions = st.columns([3, 1])
+
+                with col_info:
+                    st.write(f"**分类**: {standard['category']}")
+                    st.write(f"**文件名**: {standard['file_name']}")
+                    st.write(f"**大小**: {standard['file_size'] / 1024:.1f} KB")
+                    st.write(f"**上传时间**: {standard['upload_time']}")
+
+                    # 内容预览
+                    if standard.get('content_preview'):
+                        st.markdown("**内容预览**:")
+                        st.text_area(
+                            "preview",
+                            value=standard['content_preview'],
+                            height=100,
+                            disabled=True,
+                            label_visibility="collapsed",
+                            key=f"preview_{standard['id']}"
+                        )
+
+                with col_actions:
+                    # 查看完整内容
+                    if st.button("👁️ 查看", key=f"view_{standard['id']}", use_container_width=True):
+                        content = standards_manager.get_standard_content(standard['id'])
+                        st.session_state[f'viewing_standard_{standard["id"]}'] = content
+
+                    # 删除按钮
+                    if st.button("🗑️ 删除", key=f"del_{standard['id']}", type="secondary", use_container_width=True):
+                        st.session_state[f'confirm_delete_standard_{standard["id"]}'] = True
+
+                # 显示完整内容（如果点击了查看）
+                if st.session_state.get(f'viewing_standard_{standard["id"]}'):
+                    st.markdown("---")
+                    st.markdown("**完整内容**:")
+                    content = st.session_state[f'viewing_standard_{standard["id"]}']
+                    st.text_area(
+                        "content",
+                        value=content,
+                        height=400,
+                        label_visibility="collapsed",
+                        key=f"content_{standard['id']}"
+                    )
+
+                    if st.button("关闭", key=f"close_{standard['id']}"):
+                        del st.session_state[f'viewing_standard_{standard["id"]}']
+                        st.rerun()
+
+                # 删除确认
+                if st.session_state.get(f'confirm_delete_standard_{standard["id"]}'):
+                    st.warning("⚠️ 确认删除此标准文件？")
+                    col_yes, col_no = st.columns(2)
+
+                    with col_yes:
+                        if st.button("✅ 确认", key=f"confirm_yes_{standard['id']}", type="primary", use_container_width=True):
+                            result = standards_manager.delete_standard(standard['id'])
+                            if result['success']:
+                                st.success(result['message'])
+                                del st.session_state[f'confirm_delete_standard_{standard["id"]}']
+                                st.rerun()
+                            else:
+                                st.error(result['message'])
+
+                    with col_no:
+                        if st.button("❌ 取消", key=f"confirm_no_{standard['id']}", use_container_width=True):
+                            del st.session_state[f'confirm_delete_standard_{standard["id"]}']
+                            st.rerun()
+
+    else:
+        st.info("📭 暂无标准文件，请上传")
 
 
 if __name__ == "__main__":

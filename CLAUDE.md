@@ -6,11 +6,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Streamlit-based **Intelligent Bidding Document Review and Technical Proposal Generation System** (智能标书审查系统/智标领航) that uses Claude AI to:
 1. Parse and analyze engineering bidding documents with **7-category structured analysis**
-2. Extract evaluation criteria automatically
-3. Generate technical proposal outlines based on evaluation criteria
-4. Generate technical proposal sections step-by-step
+2. **OCR support for scanned PDFs** (automatic text recognition)
+3. **Structured table extraction** from PDF documents
+4. **National/local standards management** (upload and reference standard documents)
+5. Extract evaluation criteria automatically
+6. Generate technical proposal outlines based on evaluation criteria
+7. Generate technical proposal sections step-by-step
 
 The system is designed for internal use and operates as a standalone web application without separate frontend/backend architecture.
+
+## New Features (v1.1.0)
+
+### 🔍 OCR for Scanned PDFs
+- Automatically detects scanned PDF pages (pages with no text layer)
+- Uses **RapidOCR** engine for offline text recognition
+- Displays OCR statistics in file upload interface
+- Confidence filtering (≥0.5) to ensure quality
+
+### 📊 Structured Table Extraction
+- Extracts tables from PDF as 2D arrays (not plain text)
+- Preserves table structure for better analysis
+- Displays table count in metadata
+
+### 📚 Standards Library Management
+- **New Tab**: "国标管理" for managing standard documents
+- Upload national/industry/local standards (GB/JGJ/CJJ/DB...)
+- Automatic standard code extraction (e.g., GB50500-2013)
+- Categorization: 国家标准/行业标准/地方标准
+- Search and filter capabilities
+- Independent storage (not tied to project records)
 
 ## Development Commands
 
@@ -127,10 +151,16 @@ When loading historical records (`load_record`), files must be re-parsed from `d
 ### Service Initialization Pattern
 Services are initialized using `@st.cache_resource` to persist across Streamlit reruns:
 ```python
-ai_service, db_manager, document_parser = init_services()
+ai_service, db_manager, document_parser, standards_manager = init_services()
 ```
 
 This caching is critical - services should NOT be re-instantiated in individual functions.
+
+**Services**:
+- `ai_service` (ClaudeService): AI text generation
+- `db_manager` (DatabaseManager): Project records database
+- `document_parser` (DocumentParser): File parsing with OCR support
+- `standards_manager` (StandardsManager): Standards library management
 
 ### File Category Configuration
 File types are defined in `file_upload_tab` via `file_categories` list:
@@ -155,17 +185,69 @@ Key features:
 
 ## Module Details
 
-### `modules/document_parser.py` (175 lines)
+### `modules/document_parser.py` (~250 lines) ⭐ UPGRADED
 - **DocumentParser**: Registry pattern with `supported_formats` dict mapping extensions to parser methods
 - Each parser returns `{'content': str, 'metadata': dict}`
-- **PDF**: Uses PyMuPDF (fitz), extracts text page-by-page with encoding support
-- **Word**: Extracts paragraphs and tables separately, handles mixed Chinese/English text
-- **Excel**:
+
+**PDF Parsing (Enhanced with OCR + Table Extraction)**:
+- **Text Layer**: PyMuPDF (fitz) direct text extraction
+- **Scanned Pages**: Automatic detection (`_is_scanned_page`) + RapidOCR recognition
+  - Renders page at 2x DPI for better OCR quality
+  - Filters OCR results by confidence (≥0.5)
+  - Returns `metadata['ocr_pages']` count
+- **Table Extraction**: Uses PyMuPDF 1.23+ `find_tables()` API
+  - Extracts tables as 2D arrays: `[[header1, header2], [data1, data2]]`
+  - Converts to readable text format
+  - Returns `metadata['tables']` with structured data
+- **Methods**:
+  - `_get_ocr_engine()`: Lazy OCR engine initialization
+  - `_is_scanned_page(page)`: Detects if page has text layer (<30 chars = scanned)
+  - `_ocr_page(page)`: OCR recognition pipeline
+  - `_extract_tables(page)`: Table structure extraction
+  - `_table_to_text(table_data)`: Format table as text
+
+**Word**: Extracts paragraphs and tables separately, handles mixed Chinese/English text
+
+**Excel**:
   - Processes all sheets with `pd.ExcelFile`
   - Uses `dtype=str` to preserve original formatting (numbers, Chinese, English)
   - Uses appropriate engine: openpyxl for .xlsx, xlrd for .xls
   - Returns metadata including sheet count, names, and total rows
   - Converts DataFrames to readable string format with column width limit (100 chars)
+
+### `modules/standards_manager.py` (~380 lines) ⭐ NEW MODULE
+- **StandardsManager**: National/local standards library management
+- **Database**: SQLite (`data/standards.db`) with `StandardDocument` model
+- **Storage**: Physical files saved to `data/standards/` directory
+
+**Core Methods**:
+1. `add_standard(uploaded_file, standard_name)`: Upload and process standard document
+   - Calculates SHA256 hash to prevent duplicates
+   - Parses document to extract content preview
+   - Auto-extracts standard code (GB/JGJ/CJJ/DB patterns)
+   - Categorizes into: 国家标准/行业标准/地方标准
+2. `get_all_standards(category)`: List all standards with optional filter
+3. `get_standard_content(standard_id)`: Get full text content
+4. `delete_standard(standard_id)`: Remove standard (file + DB record)
+5. `search_standards(keyword)`: Search by code or name
+6. `get_statistics()`: Summary counts by category
+
+**Database Schema**:
+```sql
+CREATE TABLE standard_documents (
+    id INTEGER PRIMARY KEY,
+    standard_code VARCHAR(100) UNIQUE,  -- e.g. "GB50500-2013"
+    standard_name VARCHAR(500),
+    file_name VARCHAR(500),
+    file_path VARCHAR(1000),
+    file_hash VARCHAR(64),              -- SHA256
+    file_size INTEGER,
+    category VARCHAR(100),              -- 国家标准/行业标准/地方标准
+    content_preview TEXT,               -- First 500 chars
+    upload_time DATETIME,
+    update_time DATETIME
+);
+```
 
 ### `modules/ai_service.py` (412 lines)
 - **ClaudeService**: Wraps Anthropic API client
